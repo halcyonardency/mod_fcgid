@@ -421,8 +421,21 @@ handle_request(request_rec * r, int role, fcgid_cmd_conf *cmd_conf,
 {
     fcgid_command fcgi_request;
     fcgid_bucket_ctx *bucket_ctx;
-    int i, j, cond_status;
+    int i, j, cond_status, spawn_low_water, spawn_high_water, cur_busy_count;
     const char *location = NULL;
+
+    /* Number to spin up without sleeping; currently borrow the
+       min process per class count. Logically, this should probably
+       be somewhere in the range between min and max, possibly
+       directly configurable, but this is better than the (effectively)
+       hardwired value of 1 in place before. */
+	spawn_low_water = fcgi_request.cmdopts.min_class_process_count;
+
+	/* Point at which to back off creating new processes. This permits
+	   waiting longer when we're genuinely busy, without wasting time
+	   when load is in a more normal range. Again, for now this is the
+	   max permissible; */
+    spawn_high_water = fcgi_request.cmdopts.max_class_process_count;
 
     bucket_ctx = apr_pcalloc(r->pool, sizeof(*bucket_ctx));
 
@@ -447,11 +460,22 @@ handle_request(request_rec * r, int role, fcgid_cmd_conf *cmd_conf,
             if (bucket_ctx->procnode)
                 break;
 
-            /* Avoid sleeping the very first time through if there are no
+            /* Avoid sleeping the very first time through if there are few
                busy processes; the problem is just that we haven't spawned
-               anything yet, so waiting is pointless */
-            if (i > 0 || j > 0 || count_busy_processes(r, &fcgi_request)) {
-                apr_sleep(apr_time_from_sec(1));
+               enough yet, so waiting is pointless */
+			cur_busy_count = count_busy_processes(r, &fcgi_request);
+            if (i > 0 || j > 0 || cur_busy_count > spawn_low_water) {
+	            /* If under the high water mark, don't wait long. We should 
+	               have a decent chance of spinning up an available childi
+	               within 8ms. If we're over the high water mark, sleep for
+	               30ms. That does indicate heavy load, so we should
+	               be averse to spawning new processes. */
+	            if (cur_busy_count < spawn_high_water) {
+		            apr_sleep(apr_time_from_msec(8));
+		        }
+		        else {
+                    apr_sleep(apr_time_from_msec(30));
+                }
 
                 bucket_ctx->procnode = apply_free_procnode(r, &fcgi_request);
                 if (bucket_ctx->procnode)
